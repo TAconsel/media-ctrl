@@ -1,0 +1,1026 @@
+#!/usr/bin/env python3
+"""mediactrl-server: let phones on the local network control this computer's
+media players (any MPRIS player: Chrome, Firefox, Spotify, mpv, ...) and the
+system volume.
+
+Transport: JSON lines over TCP (default port 47800), announced over mDNS as
+_mediactrl._tcp.  New phones must be approved once from a desktop
+notification; approved phones are kept in ~/.config/mediactrl/devices.json.
+See PROTOCOL.md for the message format.
+
+Usage:
+  mediactrl-server [--port N] [--no-pairing]   run the server
+  mediactrl-server devices                     list approved phones
+  mediactrl-server forget ID|all               remove approved phone(s)
+"""
+
+import argparse
+import base64
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import socket
+import sys
+import threading
+import time
+import urllib.request
+
+import gi
+
+gi.require_version('Gio', '2.0')
+gi.require_version('GdkPixbuf', '2.0')
+from gi.repository import Gio, GLib, GdkPixbuf  # noqa: E402
+
+PORT = 47800
+PROTO_VERSION = 1
+SERVICE_TYPE = '_mediactrl._tcp'
+MPRIS_PREFIX = 'org.mpris.MediaPlayer2.'
+MPRIS_PATH = '/org/mpris/MediaPlayer2'
+IFACE_ROOT = 'org.mpris.MediaPlayer2'
+IFACE_PLAYER = 'org.mpris.MediaPlayer2.Player'
+IFACE_PROPS = 'org.freedesktop.DBus.Properties'
+CONFIG_DIR = os.path.join(GLib.get_user_config_dir(), 'mediactrl')
+DEVICES_FILE = os.path.join(CONFIG_DIR, 'devices.json')
+ART_MAX = 512              # longest side of album art sent to phones, px
+ART_CACHE = 48             # art entries kept in memory
+CLIENT_TIMEOUT = 75        # s without any message (phones ping every 25 s)
+POSITION_POLL = 3          # s between Position polls (MPRIS does not signal it)
+SEEK_TOLERANCE = 800_000   # us of drift before a fresh position is pushed
+DENY_HOLDOFF = 600         # s a denied phone is refused without asking again
+MAX_QUEUE = 8 << 20        # bytes queued to a slow client before dropping it
+
+
+def log(*args):
+    print(*args, file=sys.stderr, flush=True)
+
+
+def load_devices():
+    try:
+        with open(DEVICES_FILE) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        log(f'devices: cannot read {DEVICES_FILE}: {e}')
+        return {}
+
+
+def save_devices(devices):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    tmp = DEVICES_FILE + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(devices, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, DEVICES_FILE)
+
+
+def address_allowed(addr):
+    """Only private, loopback and link-local peers may talk to us."""
+    try:
+        ip = ipaddress.ip_address(addr.split('%')[0])
+    except ValueError:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    return ip.is_private or ip.is_loopback or ip.is_link_local
+
+
+# --------------------------------------------------------------------------
+# MPRIS players
+
+class Player:
+    def __init__(self, srv, name, owner):
+        self.srv = srv
+        self.name = name                    # org.mpris.MediaPlayer2.xxx
+        self.owner = owner                  # unique bus name
+        self.identity = name[len(MPRIS_PREFIX):]
+        self.props = {}
+        self.pid = None
+        self.ready = False
+        self.position = 0                   # us, as of pos_mono
+        self.pos_mono = time.monotonic()
+        self.last_active = 0.0              # monotonic time it last started playing
+        self.art_url = None
+        self.art_id = None
+        bus = srv.bus
+        self.subs = [
+            bus.signal_subscribe(owner, IFACE_PROPS, 'PropertiesChanged', MPRIS_PATH,
+                                 None, Gio.DBusSignalFlags.NONE, self._on_props_changed),
+            bus.signal_subscribe(owner, IFACE_PLAYER, 'Seeked', MPRIS_PATH,
+                                 None, Gio.DBusSignalFlags.NONE, self._on_seeked),
+        ]
+        srv.call(name, MPRIS_PATH, IFACE_PROPS, 'GetAll', GLib.Variant('(s)', (IFACE_PLAYER,)),
+                 self._on_get_all)
+        srv.call(name, MPRIS_PATH, IFACE_PROPS, 'GetAll', GLib.Variant('(s)', (IFACE_ROOT,)),
+                 self._on_get_all_root)
+        srv.call('org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus',
+                 'GetConnectionUnixProcessID', GLib.Variant('(s)', (owner,)), self._on_pid)
+
+    def destroy(self):
+        for s in self.subs:
+            self.srv.bus.signal_unsubscribe(s)
+        self.subs = []
+
+    # -- D-Bus replies and signals
+    def _on_get_all(self, result, err):
+        if err:
+            log(f'{self.name}: GetAll failed: {err.message}')
+            return
+        self.props = dict(result[0])
+        self.ready = True
+        if self.status == 'Playing':
+            self.last_active = time.monotonic()
+        self._metadata_changed()
+        self.refresh_position()
+        self.srv.player_changed(self)
+
+    def _on_get_all_root(self, result, err):
+        if err:
+            return
+        ident = result[0].get('Identity')
+        if ident:
+            self.identity = ident
+            self.srv.player_changed(self)
+
+    def _on_pid(self, result, err):
+        if not err:
+            self.pid = result[0]
+            self.srv.player_changed(self)
+
+    def _on_props_changed(self, conn, sender, path, iface, signal, params):
+        iface_name, changed, invalidated = params.unpack()
+        if iface_name == IFACE_ROOT and 'Identity' in changed:
+            self.identity = changed['Identity']
+            self.srv.player_changed(self)
+            return
+        if iface_name != IFACE_PLAYER:
+            return
+        old_status = self.status
+        self.props.update(changed)
+        if invalidated:
+            self.srv.call(self.name, MPRIS_PATH, IFACE_PROPS, 'GetAll',
+                          GLib.Variant('(s)', (IFACE_PLAYER,)), self._on_get_all)
+        if self.status == 'Playing' and old_status != 'Playing':
+            self.last_active = time.monotonic()
+        if 'Metadata' in changed:
+            self._metadata_changed()
+        if 'PlaybackStatus' in changed or 'Metadata' in changed or 'Rate' in changed:
+            # freeze the extrapolated position at the transition, then ask
+            self.position = self.current_position(cap=False)
+            self.pos_mono = time.monotonic()
+            self.refresh_position()
+        self.srv.player_changed(self)
+
+    def _on_seeked(self, conn, sender, path, iface, signal, params):
+        self.position = params.unpack()[0]
+        self.pos_mono = time.monotonic()
+        self.srv.player_changed(self)
+
+    def refresh_position(self, push_if_drift=False):
+        def done(result, err):
+            if err:
+                return
+            pos = int(result[0])
+            if push_if_drift and abs(pos - self.current_position(cap=False)) < SEEK_TOLERANCE:
+                return
+            self.position = pos
+            self.pos_mono = time.monotonic()
+            self.srv.player_changed(self)
+        self.srv.call(self.name, MPRIS_PATH, IFACE_PROPS, 'Get',
+                      GLib.Variant('(ss)', (IFACE_PLAYER, 'Position')), done)
+
+    def _metadata_changed(self):
+        url = self.metadata.get('mpris:artUrl') or None
+        if url == self.art_url:
+            return
+        self.art_url = url
+        # Plasma's browser integration rewrites the artwork file on every
+        # play/pause; keep showing the old picture while the same track's
+        # new file loads instead of flashing the placeholder.
+        track = (self.metadata.get('xesam:title'), str(self.metadata.get('xesam:artist')))
+        if track != getattr(self, 'art_track', None) or not url:
+            self.art_id = None
+        self.art_track = track
+        if url:
+            def loaded(art_id):
+                if self.art_url == url:
+                    self.art_id = art_id
+                    self.srv.player_changed(self)
+            self.srv.art.load(url, loaded)
+
+    # -- state
+    @property
+    def metadata(self):
+        return self.props.get('Metadata') or {}
+
+    @property
+    def status(self):
+        return self.props.get('PlaybackStatus', 'Stopped')
+
+    @property
+    def rate(self):
+        try:
+            return float(self.props.get('Rate', 1.0))
+        except (TypeError, ValueError):
+            return 1.0
+
+    @property
+    def length(self):
+        try:
+            return max(0, int(self.metadata.get('mpris:length', 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def current_position(self, cap=True):
+        pos = self.position
+        if self.status == 'Playing':
+            pos += int((time.monotonic() - self.pos_mono) * 1e6 * self.rate)
+        if cap and self.length:
+            pos = min(pos, self.length)
+        return max(0, pos)
+
+    def to_json(self):
+        md, p = self.metadata, self.props
+        artist = md.get('xesam:artist') or ''
+        if isinstance(artist, (list, tuple)):
+            artist = ', '.join(a for a in artist if a)
+        out = {
+            'id': self.name,
+            'identity': self.identity,
+            'status': self.status,
+            'title': md.get('xesam:title') or '',
+            'artist': artist,
+            'album': md.get('xesam:album') or '',
+            'length': self.length,
+            'position': self.current_position(),
+            'rate': self.rate,
+            'canControl': bool(p.get('CanControl', True)),
+            'canPlay': bool(p.get('CanPlay', False)),
+            'canPause': bool(p.get('CanPause', False)),
+            'canNext': bool(p.get('CanGoNext', False)),
+            'canPrev': bool(p.get('CanGoPrevious', False)),
+            'canSeek': bool(p.get('CanSeek', False)) and self.length > 0,
+            'art': self.art_id,
+        }
+        if 'Volume' in p:
+            out['volume'] = float(p['Volume'])
+        if 'Shuffle' in p:
+            out['shuffle'] = bool(p['Shuffle'])
+        if 'LoopStatus' in p:
+            out['loop'] = str(p['LoopStatus'])
+        return out
+
+
+# --------------------------------------------------------------------------
+# Album art: file://, http(s):// and data: URLs, scaled down and re-encoded
+
+class ArtCache:
+    def __init__(self):
+        self.by_url = {}     # url -> art id (or None when unloadable)
+        self.data = {}       # art id -> message dict
+
+    def load(self, url, cb):
+        if url in self.by_url:
+            cb(self.by_url[url])
+            return
+
+        def work():
+            msg = None
+            try:
+                raw = self._fetch(url)
+                if raw:
+                    msg = self._encode(raw)
+            except Exception as e:  # noqa: BLE001 - any failure just means no art
+                log(f'art: {url[:120]}: {e}')
+            GLib.idle_add(finish, msg)
+
+        def finish(msg):
+            art_id = msg['id'] if msg else None
+            if msg:
+                self.data[art_id] = msg
+            self.by_url[url] = art_id
+            while len(self.by_url) > ART_CACHE:
+                self.by_url.pop(next(iter(self.by_url)))
+            live = set(self.by_url.values())
+            for k in [k for k in self.data if k not in live]:
+                del self.data[k]
+            cb(art_id)
+            return False
+
+        threading.Thread(target=work, daemon=True).start()
+
+    @staticmethod
+    def _fetch(url):
+        if url.startswith('file://'):
+            path = Gio.File.new_for_uri(url).get_path()
+            with open(path, 'rb') as f:
+                return f.read(16 << 20)
+        if url.startswith(('http://', 'https://')):
+            req = urllib.request.Request(url, headers={'User-Agent': 'mediactrl-server'})
+            with urllib.request.urlopen(req, timeout=8) as r:
+                return r.read(16 << 20)
+        if url.startswith('data:') and ';base64,' in url:
+            return base64.b64decode(url.split(';base64,', 1)[1])
+        return None
+
+    @staticmethod
+    def _encode(raw):
+        loader = GdkPixbuf.PixbufLoader()
+        loader.write(raw)
+        loader.close()
+        pb = loader.get_pixbuf()
+        w, h = pb.get_width(), pb.get_height()
+        if max(w, h) > ART_MAX:
+            s = ART_MAX / max(w, h)
+            pb = pb.scale_simple(max(1, round(w * s)), max(1, round(h * s)),
+                                 GdkPixbuf.InterpType.HYPER)
+        if pb.get_has_alpha():  # flatten onto black; JPEG is ~5x smaller than PNG
+            flat = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, False, 8,
+                                        pb.get_width(), pb.get_height())
+            flat.fill(0x000000ff)
+            pb.composite(flat, 0, 0, pb.get_width(), pb.get_height(), 0, 0, 1, 1,
+                         GdkPixbuf.InterpType.NEAREST, 255)
+            pb = flat
+        ok, buf = pb.save_to_bufferv('jpeg', ['quality'], ['88'])
+        mime = 'image/jpeg'
+        if not ok:
+            return None
+        art_id = hashlib.sha1(buf).hexdigest()[:16]
+        return {'t': 'art', 'id': art_id, 'mime': mime,
+                'data': base64.b64encode(buf).decode('ascii')}
+
+
+# --------------------------------------------------------------------------
+# System (default sink) volume via WirePlumber
+
+class SystemVolume:
+    TARGET = '@DEFAULT_AUDIO_SINK@'
+    EVENT_RE = re.compile(r"on (sink|server) #")
+
+    def __init__(self, on_change):
+        self.on_change = on_change
+        self.volume = None
+        self.muted = False
+        self._pending = 0
+        self._refresh_running = False
+        self._refresh_again = False
+        self._watch()
+        self.refresh()
+
+    def _watch(self):
+        try:
+            proc = Gio.Subprocess.new(['pactl', 'subscribe'], Gio.SubprocessFlags.STDOUT_PIPE)
+        except GLib.Error as e:
+            log(f'volume: cannot watch (pactl subscribe): {e.message}; polling')
+            GLib.timeout_add_seconds(2, lambda: (self.refresh(), True)[1])
+            return
+        stream = Gio.DataInputStream.new(proc.get_stdout_pipe())
+
+        def on_line(src, res):
+            try:
+                line, _ = src.read_line_finish_utf8(res)
+            except GLib.Error:
+                line = None
+            if line is None:
+                log('volume: pactl subscribe ended, restarting')
+                GLib.timeout_add_seconds(2, lambda: (self._watch(), self.refresh(), False)[2])
+                return
+            if self.EVENT_RE.search(line):
+                self._schedule()
+            src.read_line_async(GLib.PRIORITY_DEFAULT, None, on_line)
+
+        stream.read_line_async(GLib.PRIORITY_DEFAULT, None, on_line)
+
+    def _schedule(self):
+        if not self._pending:
+            self._pending = GLib.timeout_add(40, self._fire)
+
+    def _fire(self):
+        self._pending = 0
+        self.refresh()
+        return False
+
+    def refresh(self):
+        if self._refresh_running:
+            self._refresh_again = True
+            return
+        self._refresh_running = True
+
+        def done(proc, res):
+            self._refresh_running = False
+            try:
+                _, out, _ = proc.communicate_utf8_finish(res)
+            except GLib.Error:
+                out = ''
+            m = re.search(r'Volume:\s*([0-9.]+)', out or '')
+            if m:
+                vol, muted = float(m.group(1)), '[MUTED]' in out
+                if (vol, muted) != (self.volume, self.muted):
+                    self.volume, self.muted = vol, muted
+                    self.on_change()
+            if self._refresh_again:
+                self._refresh_again = False
+                self.refresh()
+
+        try:
+            proc = Gio.Subprocess.new(['wpctl', 'get-volume', self.TARGET],
+                                      Gio.SubprocessFlags.STDOUT_PIPE)
+            proc.communicate_utf8_async(None, None, done)
+        except GLib.Error as e:
+            self._refresh_running = False
+            log(f'volume: {e.message}')
+
+    @staticmethod
+    def _run(argv):
+        try:
+            Gio.Subprocess.new(argv, Gio.SubprocessFlags.NONE)
+        except GLib.Error as e:
+            log(f'volume: {e.message}')
+
+    def set_volume(self, v):
+        v = min(1.0, max(0.0, float(v)))
+        self._run(['wpctl', 'set-volume', self.TARGET, f'{v:.3f}'])
+        if self.muted and v > 0:
+            self._run(['wpctl', 'set-mute', self.TARGET, '0'])
+
+    def set_muted(self, muted):
+        self._run(['wpctl', 'set-mute', self.TARGET, '1' if muted else '0'])
+
+    def to_json(self):
+        return {'t': 'sysvol', 'volume': self.volume, 'muted': self.muted}
+
+
+# --------------------------------------------------------------------------
+# mDNS announcement through avahi-daemon (system bus, no root needed)
+
+class AvahiPublisher:
+    def __init__(self, name, port):
+        self.name = name
+        self.port = port
+        self.group = None
+        self.sub = None
+        try:
+            self.bus = Gio.bus_get_sync(Gio.BusType.SYSTEM)
+        except GLib.Error as e:
+            log(f'mdns: no system bus: {e.message}')
+            return
+        Gio.bus_watch_name_on_connection(self.bus, 'org.freedesktop.Avahi',
+                                         Gio.BusNameWatcherFlags.NONE,
+                                         self._appeared, self._vanished)
+
+    def _call(self, path, iface, method, args=None):
+        return self.bus.call_sync('org.freedesktop.Avahi', path, iface, method, args,
+                                  None, Gio.DBusCallFlags.NONE, 5000, None).unpack()
+
+    def _appeared(self, conn, name, owner):
+        try:
+            self.group = self._call('/', 'org.freedesktop.Avahi.Server', 'EntryGroupNew')[0]
+            self.sub = self.bus.signal_subscribe(
+                owner, 'org.freedesktop.Avahi.EntryGroup', 'StateChanged', self.group, None,
+                Gio.DBusSignalFlags.NONE, self._state_changed)
+            self._add()
+        except GLib.Error as e:
+            log(f'mdns: cannot publish: {e.message}')
+
+    def _add(self):
+        txt = [f'v={PROTO_VERSION}'.encode()]
+        self._call(self.group, 'org.freedesktop.Avahi.EntryGroup', 'AddService',
+                   GLib.Variant('(iiussssqaay)', (-1, -1, 0, self.name, SERVICE_TYPE,
+                                                  '', '', self.port, txt)))
+        self._call(self.group, 'org.freedesktop.Avahi.EntryGroup', 'Commit')
+
+    def _state_changed(self, conn, sender, path, iface, signal, params):
+        state, err = params.unpack()
+        if state == 2:
+            log(f'mdns: announced "{self.name}" as {SERVICE_TYPE} port {self.port}')
+        elif state == 3:  # collision
+            self.name = self._call('/', 'org.freedesktop.Avahi.Server',
+                                   'GetAlternativeServiceName',
+                                   GLib.Variant('(s)', (self.name,)))[0]
+            log(f'mdns: name collision, retrying as "{self.name}"')
+            self._call(self.group, 'org.freedesktop.Avahi.EntryGroup', 'Reset')
+            self._add()
+        elif state == 4:
+            log(f'mdns: failure: {err}')
+
+    def _vanished(self, conn, name):
+        if self.sub is not None:
+            self.bus.signal_unsubscribe(self.sub)
+        self.group = self.sub = None
+
+
+# --------------------------------------------------------------------------
+# Phone pairing: approve new devices from a desktop notification
+
+class Pairing:
+    def __init__(self, srv):
+        self.srv = srv
+        self.notes = {}       # notification id -> device id
+        self.waiting = {}     # device id -> set of clients
+        self.note_of = {}     # device id -> notification id
+        self.denied = {}      # device id -> monotonic time
+        self.notifier_owner = None
+        bus = srv.bus
+        bus.signal_subscribe(None, 'org.freedesktop.Notifications', 'ActionInvoked',
+                             '/org/freedesktop/Notifications', None,
+                             Gio.DBusSignalFlags.NONE, self._on_action)
+        bus.signal_subscribe(None, 'org.freedesktop.Notifications', 'NotificationClosed',
+                             '/org/freedesktop/Notifications', None,
+                             Gio.DBusSignalFlags.NONE, self._on_closed)
+
+    def request(self, client):
+        dev = client.device_id
+        if time.monotonic() - self.denied.get(dev, -1e9) < DENY_HOLDOFF:
+            client.deny()
+            return
+        self.waiting.setdefault(dev, set()).add(client)
+        client.send({'t': 'pending', 'host': self.srv.display_name})
+        if dev in self.note_of:
+            return
+        self.note_of[dev] = None  # notification being created
+
+        def shown(result, err):
+            if err:
+                log(f'pairing: cannot show notification: {err.message}')
+                self.note_of.pop(dev, None)
+                return
+            nid = result[0]
+            self.note_of[dev] = nid
+            self.notes[nid] = dev
+            if not self.waiting.get(dev):    # phone gave up meanwhile
+                self._close_note(dev)
+
+        def owner(result, err):
+            self.notifier_owner = None if err else result[0]
+
+        self.srv.call('org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus',
+                      'GetNameOwner', GLib.Variant('(s)', ('org.freedesktop.Notifications',)),
+                      owner)
+        body = (f'<b>{GLib.markup_escape_text(client.device_name)}</b> at {client.addr} '
+                f'wants to control media playback and volume on this computer.')
+        hints = {'urgency': GLib.Variant('y', 2), 'resident': GLib.Variant('b', True),
+                 'x-kde-appname': GLib.Variant('s', 'Media Control')}
+        self.srv.call('org.freedesktop.Notifications', '/org/freedesktop/Notifications',
+                      'org.freedesktop.Notifications', 'Notify',
+                      GLib.Variant('(susssasa{sv}i)', (
+                          'Media Control', 0, 'smartphone', 'Allow phone to control media?',
+                          body, ['allow', 'Allow', 'deny', 'Deny'], hints, 0)),
+                      shown)
+
+    def client_gone(self, client):
+        dev = client.device_id
+        clients = self.waiting.get(dev)
+        if clients is None:
+            return
+        clients.discard(client)
+        if not clients:
+            del self.waiting[dev]
+            self._close_note(dev)
+
+    def _close_note(self, dev):
+        nid = self.note_of.get(dev)
+        if nid:
+            self.note_of.pop(dev, None)
+            self.notes.pop(nid, None)
+            self.srv.call('org.freedesktop.Notifications', '/org/freedesktop/Notifications',
+                          'org.freedesktop.Notifications', 'CloseNotification',
+                          GLib.Variant('(u)', (nid,)), None)
+
+    def _on_action(self, conn, sender, path, iface, signal, params):
+        nid, action = params.unpack()
+        if nid not in self.notes or (self.notifier_owner and sender != self.notifier_owner):
+            return
+        dev = self.notes.pop(nid)
+        self.note_of.pop(dev, None)
+        clients = self.waiting.pop(dev, set())
+        if action == 'allow':
+            name = next(iter(clients)).device_name if clients else dev
+            devices = load_devices()
+            devices[dev] = {'name': name, 'added': int(time.time()), 'last_seen': int(time.time())}
+            save_devices(devices)
+            log(f'pairing: approved {name} ({dev})')
+            for c in clients:
+                c.welcome()
+        else:
+            self.denied[dev] = time.monotonic()
+            log(f'pairing: denied {dev}')
+            for c in clients:
+                c.deny()
+
+    def _on_closed(self, conn, sender, path, iface, signal, params):
+        nid, _reason = params.unpack()
+        dev = self.notes.pop(nid, None)
+        if dev is not None:
+            self.note_of.pop(dev, None)   # a reconnect asks again
+
+
+# --------------------------------------------------------------------------
+# Network clients
+
+class Client:
+    def __init__(self, srv, conn, addr):
+        self.srv = srv
+        self.conn = conn
+        self.addr = addr
+        self.state = 'hello'          # hello -> pending -> ok | closed
+        self.device_id = None
+        self.device_name = '?'
+        self.sent_art = set()
+        self.last_rx = time.monotonic()
+        self.queue = []
+        self.queued = 0
+        self.writing = False
+        self.cancel = Gio.Cancellable()
+        sock = conn.get_socket()
+        sock.set_keepalive(True)
+        try:
+            sock.set_option(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except GLib.Error:
+            pass
+        self.inp = Gio.DataInputStream.new(conn.get_input_stream())
+        self.out = conn.get_output_stream()
+        self._read()
+
+    def __repr__(self):
+        return f'{self.device_name}@{self.addr}'
+
+    # -- I/O
+    def _read(self):
+        self.inp.read_line_async(GLib.PRIORITY_DEFAULT, self.cancel, self._on_line)
+
+    def _on_line(self, src, res):
+        try:
+            line, _ = src.read_line_finish_utf8(res)
+        except GLib.Error as e:
+            if self.state != 'closed':
+                self.close(e.message)
+            return
+        if line is None:
+            self.close('disconnected')
+            return
+        self.last_rx = time.monotonic()
+        line = line.strip()
+        if line:
+            try:
+                msg = json.loads(line)
+                if not isinstance(msg, dict):
+                    raise ValueError('not an object')
+            except ValueError as e:
+                self.close(f'bad message: {e}')
+                return
+            try:
+                self.handle(msg)
+            except Exception as e:  # noqa: BLE001 - a bad request must not kill the server
+                log(f'{self}: error handling {line[:200]}: {e!r}')
+        if self.state != 'closed':
+            self._read()
+
+    def send(self, msg):
+        if self.state == 'closed':
+            return
+        data = (json.dumps(msg, separators=(',', ':'), ensure_ascii=False) + '\n').encode()
+        self.queue.append(data)
+        self.queued += len(data)
+        if self.queued > MAX_QUEUE:
+            self.close('too slow')
+            return
+        self._pump()
+
+    def _pump(self):
+        if self.writing or not self.queue or self.state == 'closed':
+            return
+        buf = b''.join(self.queue)
+        self.queue.clear()
+        self.writing = True
+        self.out.write_bytes_async(GLib.Bytes.new(buf), GLib.PRIORITY_DEFAULT, self.cancel,
+                                   self._on_written, buf)
+
+    def _on_written(self, src, res, buf):
+        self.writing = False
+        try:
+            n = src.write_bytes_finish(res)
+        except GLib.Error as e:
+            if self.state != 'closed':
+                self.close(e.message)
+            return
+        self.queued -= n
+        if n < len(buf):
+            self.queue.insert(0, buf[n:])
+        self._pump()
+
+    def close(self, why):
+        if self.state == 'closed':
+            return
+        was = self.state
+        self.state = 'closed'
+        log(f'client {self}: closed ({why})')
+        self.cancel.cancel()
+        try:
+            self.conn.close(None)
+        except GLib.Error:
+            pass
+        self.srv.clients.discard(self)
+        if was == 'pending':
+            self.srv.pairing.client_gone(self)
+
+    # -- protocol
+    def welcome(self):
+        if self.state == 'closed':
+            return
+        self.state = 'ok'
+        log(f'client {self}: connected')
+        self.send({'t': 'welcome', 'v': PROTO_VERSION, 'host': self.srv.display_name})
+        self.srv.send_state(self)
+
+    def deny(self):
+        self.send({'t': 'denied'})
+        # let the message drain, then hang up
+        GLib.timeout_add(500, lambda: (self.close('denied'), False)[1])
+        self.state = 'denying'
+
+    def handle(self, msg):
+        t = msg.get('t')
+        if t == 'ping':
+            self.send({'t': 'pong'})
+            return
+        if self.state == 'hello':
+            if t != 'hello':
+                self.close('expected hello')
+                return
+            dev = str(msg.get('id') or '')[:64]
+            if not re.fullmatch(r'[A-Za-z0-9_-]{8,64}', dev):
+                self.close('bad device id')
+                return
+            self.device_id = dev
+            self.device_name = str(msg.get('name') or 'Phone')[:64]
+            devices = load_devices()
+            if dev in devices:
+                devices[dev]['last_seen'] = int(time.time())
+                devices[dev]['name'] = self.device_name
+                save_devices(devices)
+                self.welcome()
+            elif not self.srv.pairing_required:
+                self.welcome()
+            else:
+                self.state = 'pending'
+                log(f'client {self}: waiting for approval')
+                self.srv.pairing.request(self)
+            return
+        if self.state != 'ok':
+            return
+
+        srv = self.srv
+        if t == 'sysvol':
+            if 'muted' in msg:
+                srv.volume.set_muted(bool(msg['muted']))
+            if msg.get('volume') is not None:
+                srv.volume.set_volume(msg['volume'])
+            return
+        player = srv.players.get(msg.get('player'))
+        if player is None:
+            return
+        if t == 'cmd':
+            action = msg.get('action')
+            method = {'play_pause': 'PlayPause', 'play': 'Play', 'pause': 'Pause',
+                      'next': 'Next', 'previous': 'Previous', 'stop': 'Stop'}.get(action)
+            if method:
+                srv.call(player.name, MPRIS_PATH, IFACE_PLAYER, method, None, None)
+            elif action == 'raise':
+                srv.call(player.name, MPRIS_PATH, IFACE_ROOT, 'Raise', None, None)
+        elif t == 'seek':
+            pos = max(0, int(msg.get('position', 0)))
+            if player.length:
+                pos = min(pos, player.length)
+            track = player.metadata.get('mpris:trackid')
+            if track:
+                srv.call(player.name, MPRIS_PATH, IFACE_PLAYER, 'SetPosition',
+                         GLib.Variant('(ox)', (track, pos)), None)
+            else:
+                srv.call(player.name, MPRIS_PATH, IFACE_PLAYER, 'Seek',
+                         GLib.Variant('(x)', (pos - player.current_position(),)), None)
+            GLib.timeout_add(250, lambda: (player.refresh_position(), False)[1])
+        elif t == 'set':
+            prop, value = msg.get('prop'), msg.get('value')
+            if prop == 'volume':
+                v = GLib.Variant('d', min(1.0, max(0.0, float(value))))
+                name = 'Volume'
+            elif prop == 'shuffle':
+                v, name = GLib.Variant('b', bool(value)), 'Shuffle'
+            elif prop == 'loop' and value in ('None', 'Track', 'Playlist'):
+                v, name = GLib.Variant('s', value), 'LoopStatus'
+            else:
+                return
+            srv.call(player.name, MPRIS_PATH, IFACE_PROPS, 'Set',
+                     GLib.Variant('(ssv)', (IFACE_PLAYER, name, v)), None)
+
+
+# --------------------------------------------------------------------------
+
+class Server:
+    def __init__(self, port, pairing_required):
+        self.port = port
+        self.pairing_required = pairing_required
+        self.display_name = socket.gethostname()
+        self.bus = Gio.bus_get_sync(Gio.BusType.SESSION)
+        self.players = {}
+        self.clients = set()
+        self.art = ArtCache()
+        self.pairing = Pairing(self)
+        self._dirty = 0
+        self._last_players = None
+
+        self.bus.signal_subscribe('org.freedesktop.DBus', 'org.freedesktop.DBus',
+                                  'NameOwnerChanged', '/org/freedesktop/DBus', 'org.mpris.MediaPlayer2',
+                                  Gio.DBusSignalFlags.MATCH_ARG0_NAMESPACE, self._on_name_owner)
+        self.call('org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus',
+                  'ListNames', None, self._on_list_names)
+        self.volume = SystemVolume(self._volume_changed)
+
+        self.service = Gio.SocketService.new()
+        self.service.add_inet_port(port, None)
+        self.service.connect('incoming', self._on_incoming)
+        self.service.start()
+        log(f'listening on tcp port {port}'
+            + ('' if pairing_required else ' (pairing disabled)'))
+        self.avahi = AvahiPublisher(self.display_name, port)
+        GLib.timeout_add_seconds(POSITION_POLL, self._poll)
+        GLib.timeout_add_seconds(10, self._reap)
+
+    def call(self, dest, path, iface, method, params, cb, timeout=3000):
+        def done(conn, res):
+            try:
+                r = conn.call_finish(res)
+            except GLib.Error as e:
+                if cb:
+                    cb(None, e)
+                else:
+                    log(f'{dest} {method}: {e.message}')
+                return
+            if cb:
+                cb(r.unpack(), None)
+        self.bus.call(dest, path, iface, method, params, None, Gio.DBusCallFlags.NONE,
+                      timeout, None, done)
+
+    # -- players
+    def _on_list_names(self, result, err):
+        if err:
+            log(f'ListNames: {err.message}')
+            return
+        for name in result[0]:
+            if name.startswith(MPRIS_PREFIX):
+                self.call('org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus',
+                          'GetNameOwner', GLib.Variant('(s)', (name,)),
+                          lambda r, e, n=name: e or self._add_player(n, r[0]))
+
+    def _on_name_owner(self, conn, sender, path, iface, signal, params):
+        name, old, new = params.unpack()
+        if not name.startswith(MPRIS_PREFIX):
+            return
+        if old and name in self.players:
+            self.players.pop(name).destroy()
+            log(f'player gone: {name}')
+            self._mark_dirty()
+        if new:
+            self._add_player(name, new)
+
+    def _add_player(self, name, owner):
+        if name in self.players:
+            if self.players[name].owner == owner:
+                return
+            self.players.pop(name).destroy()
+        log(f'player: {name}')
+        self.players[name] = Player(self, name, owner)
+
+    def visible_players(self):
+        """Ready players, minus browsers that plasma-browser-integration
+        already mirrors with richer metadata (same thing KDE's own applet does)."""
+        ready = [p for p in self.players.values() if p.ready]
+        mirrored = {p.metadata.get('kde:pid') for p in ready} - {None}
+        return [p for p in ready
+                if not (p.pid in mirrored and 'kde:pid' not in p.metadata)]
+
+    def active_player(self, players):
+        if not players:
+            return None
+        playing = [p for p in players if p.status == 'Playing']
+        pool = playing or players
+        return max(pool, key=lambda p: p.last_active).name
+
+    def player_changed(self, player):
+        self._mark_dirty()
+
+    def _mark_dirty(self):
+        if not self._dirty:
+            self._dirty = GLib.timeout_add(30, self._flush)
+
+    def _players_msg(self):
+        players = self.visible_players()
+        players.sort(key=lambda p: -p.last_active)
+        return players, {'t': 'players', 'active': self.active_player(players),
+                         'players': [p.to_json() for p in players]}
+
+    def _flush(self):
+        self._dirty = 0
+        players, msg = self._players_msg()
+        for c in list(self.clients):
+            if c.state == 'ok':
+                self._send_art(c, players)
+                c.send(msg)
+        return False
+
+    def _send_art(self, client, players):
+        for p in players:
+            if p.art_id and p.art_id not in client.sent_art and p.art_id in self.art.data:
+                client.send(self.art.data[p.art_id])
+                client.sent_art.add(p.art_id)
+
+    def send_state(self, client):
+        players, msg = self._players_msg()
+        self._send_art(client, players)
+        client.send(msg)
+        if self.volume.volume is not None:
+            client.send(self.volume.to_json())
+
+    def _volume_changed(self):
+        msg = self.volume.to_json()
+        for c in list(self.clients):
+            if c.state == 'ok':
+                c.send(msg)
+
+    def _poll(self):
+        if any(c.state == 'ok' for c in self.clients):
+            for p in self.visible_players():
+                p.refresh_position(push_if_drift=True)
+        return True
+
+    def _reap(self):
+        now = time.monotonic()
+        for c in list(self.clients):
+            if now - c.last_rx > CLIENT_TIMEOUT:
+                c.close('timeout')
+        return True
+
+    # -- network
+    def _on_incoming(self, service, conn, source):
+        try:
+            addr = conn.get_remote_address().get_address().to_string()
+        except GLib.Error:
+            addr = '?'
+        if not address_allowed(addr):
+            log(f'refusing {addr}: not a local-network address')
+            conn.close(None)
+            return True
+        self.clients.add(Client(self, conn, addr))
+        return True
+
+
+def main():
+    ap = argparse.ArgumentParser(description='Control this computer\'s media players from a phone '
+                                             'on the local network.')
+    ap.add_argument('--port', type=int, default=PORT)
+    ap.add_argument('--no-pairing', action='store_true',
+                    help='accept any phone on the local network without asking')
+    sub = ap.add_subparsers(dest='command')
+    sub.add_parser('devices', help='list approved phones')
+    fp = sub.add_parser('forget', help='remove an approved phone')
+    fp.add_argument('id', help="device id from 'devices', or 'all'")
+    args = ap.parse_args()
+
+    if args.command == 'devices':
+        devices = load_devices()
+        if not devices:
+            print('no approved phones')
+        for dev, info in devices.items():
+            seen = time.strftime('%Y-%m-%d %H:%M', time.localtime(info.get('last_seen', 0)))
+            print(f'{dev}  {info.get("name", "?")}  (last seen {seen})')
+        return
+    if args.command == 'forget':
+        devices = load_devices()
+        if args.id == 'all':
+            devices = {}
+        elif devices.pop(args.id, None) is None:
+            sys.exit(f'unknown device {args.id}')
+        save_devices(devices)
+        print('done (phones already connected stay connected until they reconnect)')
+        return
+
+    loop = GLib.MainLoop()
+    try:
+        Server(args.port, not args.no_pairing)
+    except GLib.Error as e:
+        sys.exit(f'mediactrl-server: {e.message}')
+    try:
+        gi.require_version('GLibUnix', '2.0')
+        from gi.repository import GLibUnix
+        signal_add = GLibUnix.signal_add
+    except (ImportError, ValueError):
+        signal_add = GLib.unix_signal_add
+    for sig in (2, 15):  # SIGINT, SIGTERM
+        signal_add(GLib.PRIORITY_DEFAULT, sig, lambda: (loop.quit(), False)[1])
+    loop.run()
+
+
+if __name__ == '__main__':
+    main()

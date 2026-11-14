@@ -1,0 +1,12 @@
+[Unit]
+Description=Media Control server (phone remote for MPRIS media players)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/mediactrl-server
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target
